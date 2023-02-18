@@ -1,12 +1,12 @@
 [package]
-name = "deposit_course"
+name = "solana_escrow_anchor_course"
 version = "0.1.0"
 description = "Created with Anchor"
 edition = "2021"
 
 [lib]
 crate-type = ["cdylib", "lib"]
-name = "deposit_course"
+name = "solana_escrow_anchor_course"
 
 [features]
 no-entrypoint = []
@@ -16,6 +16,6 @@ cpi = ["no-entrypoint"]
 default = []
 
 [dependencies]
-anchor-lang     = {workspace = true, features = ["init-if-needed"]}
-anchor-spl      = {workspace = true, features = ["token", "metadata"]}
-solana-program  = {workspace = true}
+anchor-lang = "0.26.0"
+anchor-spl = "0.26.0"
+spl-token = {version = "3.5.0", features = ["no-entrypoint"]}

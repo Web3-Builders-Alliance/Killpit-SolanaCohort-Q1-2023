@@ -1,122 +1,99 @@
 use anchor_lang::prelude::*;
-use anchor_spl::{
-    associated_token::AssociatedToken,
-    metadata::{
-        create_master_edition_v3, create_metadata_accounts_v3, CreateMasterEditionV3,
-        CreateMetadataAccountsV3, MetadataAccount,
-    },
-    token::{
-        initialize_mint2, InitializeMint2, Mint, Token, TokenAccount, Transfer as SplTransfer,
-    },
-};
-
+use anchor_spl::token::{self, CloseAccount, SetAuthority, TokenAccount, Transfer};
+use anchor_spl::token::Token;
 declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
 #[program]
-pub mod deposit_course {
-
-    use anchor_lang::solana_program::hash;
-
+pub mod solana_escrow_anchor_course {
+    use spl_token::instruction::AuthorityType;
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
-        let deposit_account = &mut ctx.accounts.deposit_account;
-        deposit_account.deposit_auth = *ctx.accounts.deposit_auth.key;
-        ctx.accounts.deposit_account.auth_bump = *ctx.bumps.get("pda_auth").unwrap();
+    const ESCROW_PDA_SEED: &[u8] = b"escrow";
+
+    pub fn initialize(ctx: Context<Initialize>, amount_expected: u64, amount_paid: u64) -> Result<()> {
+        // Store data in escrow account
+        let escrow_account = &mut ctx.accounts.escrow_account;
+
+        let clock = Clock::get()?;
+        let lock_until_slot = clock.slot + UNLOCK_DUR;
+        let time_out_slot = clock.slot + TIMEOUT_AMT;
+
+        escrow_account.is_initialized = true;
+        escrow_account.initializer_pubkey = *ctx.accounts.initializer.to_account_info().key;
+        escrow_account.temp_token_account_pubkey = *ctx.accounts.temp_token_account.to_account_info().key;
+        escrow_account.initializer_token_to_receive_account_pubkey = *ctx.accounts.token_to_receive_account.to_account_info().key;
+        escrow_account.expected_amount = amount_expected;
+        escrow_account.unlock_time = lock_until_slot;
+        escrow_account.time_out = time_out_slot;
+
+        // Create PDA, which will own the temp token account
+        let (pda, _bump_seed) = Pubkey::find_program_address(&[ESCROW_PDA_SEED], ctx.program_id);
+        token::set_authority(ctx.accounts.into(), AuthorityType::AccountOwner, Some(pda))?;
+
+        // transfer to temp account -- this wasn't in the og
+        token::transfer(ctx.accounts.into_transfer_to_temp(),amount_paid)?;
+
         Ok(())
     }
+    pub fn update_timelock(ctx: Context<ResetClock>) -> Result<()>{
+        let escrow_account = &mut ctx.accounts.escrow_account;
 
-    //methods for depositing and withdrawing native tokens
-    pub fn deposit_native(ctx: Context<DepositNative>, amount: u64) -> Result<()> {
-        let deposit_account = &mut ctx.accounts.deposit_account;
-        let deposit_auth = &ctx.accounts.deposit_auth;
-        let sys_program = &ctx.accounts.system_program;
+        let clock = Clock::get()?;
+        let lock_until_slot = clock.slot + UNLOCK_DUR;
+        let time_out_slot = clock.slot + TIMEOUT_AMT;
 
-        deposit_account.sol_vault_bump = ctx.bumps.get("sol_vault").copied();
-
-        let cpi_accounts = anchor_lang::solana_program::system_program::Transfer {
-            from: deposit_auth.to_account_info(),
-            to: ctx.accounts.sol_vault.to_account_info(),
-        };
-
-        let cpi = CpiContext::new(sys_program.to_account_info(), cpi_accounts);
-
-        anchor_lang::solana_program::system_program::transfer(cpi, amount)?;
-
-        Ok(())
-    }
-
-    pub fn withdraw_native(ctx: Context<WithdrawNative>, amount: u64) -> Result<()> {
-        let sys_program = &ctx.accounts.system_program;
-        let deposit_account = &ctx.accounts.deposit_account;
-        let pda_auth = &mut ctx.accounts.pda_auth;
-        let sol_vault = &mut ctx.accounts.sol_vault;
-
-        let cpi_accounts = anchor_lang::solana_program::system_program::Transfer {
-            from: sol_vault.to_account_info(),
-            to: ctx.accounts.deposit_auth.to_account_info(),
-        };
-
-        let seeds = &[
-            b"sol_vault",
-            pda_auth.to_account_info().key.as_ref(),
-            &[deposit_account.sol_vault_bump.unwrap()],
-        ];
-
-        let signer = &[&seeds[..]];
-
-        let cpi = CpiContext::new_with_signer(sys_program.to_account_info(), cpi_accounts, signer);
-
-        anchor_lang::solana_program::system_program::transfer(cpi, amount)?;
+        escrow_account.unlock_time = lock_until_slot;
+        escrow_account.time_out = time_out_slot;
 
         Ok(())
     }
 
-    //methods for depositing and withdrawing fungible SPL tokens
-    pub fn deposit_spl(ctx: Context<DepositSpl>, amount: u64) -> Result<()> {
-        let cpi_accounts = SplTransfer {
-            from: ctx.accounts.from_token_acct.to_account_info(),
-            to: ctx.accounts.to_token_acct.to_account_info(),
-            authority: ctx.accounts.deposit_auth.to_account_info(),
-        };
+    pub fn cancel(ctx: Context<Cancel>) -> Result<()> {
+        let escrow_account = &ctx.accounts.escrow_account;
 
-        let cpi = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
+        // Get PDA
+        let (_pda, bump_seed) = Pubkey::find_program_address(&[ESCROW_PDA_SEED], ctx.program_id);
+        let seeds = &[&ESCROW_PDA_SEED[..], &[bump_seed]];
 
-        anchor_spl::token::transfer(cpi, amount)?;
+        // Return tokens to creator
+        token::transfer(
+            ctx.accounts.into_refund_context(),
+            escrow_account.expected_amount)?;
 
-        Ok(())
-    }
-
-    pub fn withdraw_spl(ctx: Context<WithdrawSpl>, amount: u64) -> Result<()> {
-        let deposit_account = &ctx.accounts.deposit_account;
-
-        let cpi_accounts = SplTransfer {
-            from: ctx.accounts.from_token_acct.to_account_info(),
-            to: ctx.accounts.to_token_acct.to_account_info(),
-            authority: ctx.accounts.pda_auth.to_account_info(),
-        };
-
-        let seeds = &[
-            b"auth",
-            deposit_account.to_account_info().key.as_ref(),
-            &[deposit_account.auth_bump],
-        ];
-
-        let signer = &[&seeds[..]];
-
-        let cpi = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts,
-            signer,
-        );
-
-        anchor_spl::token::transfer(cpi, amount)?;
+        // Close temp token account
+        token::close_account(ctx.accounts.into_close_temp_token_context().with_signer(&[&seeds[..]]))?;
 
         Ok(())
     }
 
-    pub fn create_limit(ctx: Context<CreateLimit>, ask_asset: Asset, ask_price_per_asset:u64 ) -> Result<()> {
-        let deposit_account = &mut ctx.accounts.deposit_account;
+    pub fn exchange(ctx: Context<Exchange>, amount_expected_by_taker: u64) -> Result<()> {
+        let escrow_account = &ctx.accounts.escrow_account;
+
+        let current_slot = Clock::get()?.slot;
+
+        // Time checks 
+        require!(current_slot > escrow_account.unlock_time, ErrorCode::EscrowLocked);
+        require!(current_slot < escrow_account.time_out, ErrorCode::EscrowExpired);
+
+        // Ensure that expected and deposited amount match
+        require!(amount_expected_by_taker == ctx.accounts.pdas_temp_token_account.amount, ErrorCode::ExpectedAmountMismatch);
+
+        // Get PDA
+        let (_pda, bump_seed) = Pubkey::find_program_address(&[ESCROW_PDA_SEED], ctx.program_id);
+        let seeds = &[&ESCROW_PDA_SEED[..], &[bump_seed]];
+
+        // Transfer tokens from taker to initializer
+        token::transfer(
+            ctx.accounts.into_transfer_to_initializer_context(),
+            escrow_account.expected_amount)?;
+
+        // Transfer tokens from initializer to taker
+        token::transfer(
+            ctx.accounts.into_transfer_to_taker_context().with_signer(&[&seeds[..]]),
+            amount_expected_by_taker)?;
+
+        // Close temp token account
+        token::close_account(ctx.accounts.into_close_temp_token_context().with_signer(&[&seeds[..]]))?;
 
         Ok(())
     }
@@ -124,220 +101,191 @@ pub mod deposit_course {
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(init, payer = deposit_auth, space = DepositBase::LEN)]
-    pub deposit_account: Account<'info, DepositBase>,
-    #[account(seeds = [b"auth", deposit_account.key().as_ref()], bump)]
-    /// CHECK: no need to check this.
-    pub pda_auth: UncheckedAccount<'info>,
     #[account(mut)]
-    pub deposit_auth: Signer<'info>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct DepositNative<'info> {
-    #[account(mut, has_one = deposit_auth)]
-    pub deposit_account: Account<'info, DepositBase>,
-    #[account(seeds = [b"auth", deposit_account.key().as_ref()], bump = deposit_account.auth_bump)]
-    /// CHECK: no need to check this.
-    pub pda_auth: UncheckedAccount<'info>,
-    #[account(mut, seeds = [b"sol_vault", pda_auth.key().as_ref()], bump)]
-    pub sol_vault: SystemAccount<'info>,
+    pub initializer: Signer<'info>,
     #[account(mut)]
-    pub deposit_auth: Signer<'info>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct WithdrawNative<'info> {
-    #[account(has_one = deposit_auth)]
-    pub deposit_account: Account<'info, DepositBase>,
-    #[account(seeds = [b"auth", deposit_account.key().as_ref()], bump = deposit_account.auth_bump)]
-    /// CHECK: no need to check this.
-    pub pda_auth: UncheckedAccount<'info>,
-    #[account(mut, seeds = [b"sol_vault", pda_auth.key().as_ref()], bump = deposit_account.sol_vault_bump.unwrap())]
-    pub sol_vault: SystemAccount<'info>,
+    pub initializers_token_to_send_account: Account<'info, TokenAccount>,
     #[account(mut)]
-    pub deposit_auth: Signer<'info>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct DepositSpl<'info> {
-    #[account(has_one = deposit_auth)]
-    pub deposit_account: Account<'info, DepositBase>,
-    #[account(seeds = [b"auth", deposit_account.key().as_ref()], bump = deposit_account.auth_bump)]
-    /// CHECK: no need to check this.
-    pub pda_auth: UncheckedAccount<'info>,
-    #[account(mut)]
-    pub deposit_auth: Signer<'info>,
+    pub temp_token_account: Account<'info, TokenAccount>,
     #[account(
-        init_if_needed,
-        associated_token::mint = token_mint,
-        payer = deposit_auth,
-        associated_token::authority = pda_auth,
+        constraint = *token_to_receive_account.to_account_info().owner == spl_token::id() @ ProgramError::IncorrectProgramId
     )]
-    pub to_token_acct: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub from_token_acct: Account<'info, TokenAccount>,
-    pub token_mint: Account<'info, Mint>,
-    pub token_program: Program<'info, Token>,
-    pub associated_token_program: Program<'info, AssociatedToken>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct WithdrawSpl<'info> {
-    #[account(has_one = deposit_auth)]
-    pub deposit_account: Account<'info, DepositBase>,
-    #[account(seeds = [b"auth", deposit_account.key().as_ref()], bump = deposit_account.auth_bump)]
-    /// CHECK: no need to check this.
-    pub pda_auth: UncheckedAccount<'info>,
-    #[account(mut)]
-    pub deposit_auth: Signer<'info>,
-    #[account(mut)]
-    pub to_token_acct: Account<'info, TokenAccount>,
-    #[account(mut,
-        associated_token::mint = token_mint,
-        associated_token::authority = pda_auth,
+    pub token_to_receive_account: Account<'info, TokenAccount>,
+    #[account(
+        init, payer = initializer, space = Escrow::LEN,
+        constraint = !escrow_account.is_initialized @ ProgramError::AccountAlreadyInitialized
     )]
-    pub from_token_acct: Account<'info, TokenAccount>,
-    pub token_mint: Account<'info, Mint>,
+    pub escrow_account: Account<'info, Escrow>,
+    #[account(address = spl_token::id())]
+    pub token_program: AccountInfo<'info>,
+    pub system_program: Program<'info, System>,
+}
+#[derive(Accounts)]
+pub struct ResetClock<'info> {
+    #[account(
+        mut,
+        address = escrow_account.initializer_pubkey.key() @ ProgramError::InvalidAccountData
+    )]
+    pub update_auth: Signer<'info>,
+    #[account(
+        constraint = escrow_account.is_initialized @ ProgramError::AccountAlreadyInitialized
+    )]
+    pub escrow_account: Account<'info, Escrow>,
+    pub system_program: Program<'info, System>,
+
+}
+
+#[derive(Accounts)]
+pub struct Exchange<'info> {
+    #[account(mut)]
+    pub taker: Signer<'info>,
+    #[account(mut)]
+    pub takers_sending_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub takers_token_to_receive_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub pdas_temp_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub initializers_main_account: AccountInfo<'info>,
+    #[account(mut)]
+    pub initializers_token_to_receive_account: Account<'info, TokenAccount>,
+    #[account(mut, close = initializers_main_account,
+        constraint = escrow_account.temp_token_account_pubkey == *pdas_temp_token_account.to_account_info().key @ ProgramError::InvalidAccountData,
+        constraint = escrow_account.initializer_pubkey == *initializers_main_account.to_account_info().key @ ProgramError::InvalidAccountData,
+        constraint = escrow_account.initializer_token_to_receive_account_pubkey == *initializers_token_to_receive_account.to_account_info().key @ ProgramError::InvalidAccountData,
+    )]
+    pub escrow_account: Box<Account<'info, Escrow>>,
     pub token_program: Program<'info, Token>,
-    pub associated_token_program: Program<'info, AssociatedToken>,
-    pub system_program: Program<'info, System>,
+    pub pda_account: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
-pub struct CreateLimit<'info> {
-    #[account(has_one = deposit_auth)]
-    pub deposit_account: Account<'info, DepositBase>,
-    #[account(seeds = [b"auth", deposit_account.key().as_ref()], bump = deposit_account.auth_bump)]
-    pub pda_auth: UncheckedAccount<'info>,
+pub struct Cancel<'info> {
+    #[account(
+        mut,
+        address = escrow_account.initializer_pubkey.key() @ ProgramError::InvalidAccountData
+    )]
+    pub update_auth: Signer<'info>,
     #[account(mut)]
-    pub deposit_auth: Signer<'info>,
-    #[account(init, seeds = [b"limit", token_mint.key().as_ref(), deposit_account.key().as_ref()], bump, payer = deposit_auth, space = Limit::LEN)]
-    pub limit_account: Account<'info, Limit>,
-    pub token_account: Account<'info, TokenAccount>,
-    pub token_mint: Account<'info, Mint>,
-    #[account(owner = Token::id())]
-    pub ask_token_mint: Account<'info, Mint>,
+    pub authority_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub pdas_temp_token_account: Account<'info, TokenAccount>,
+    #[account(
+        constraint = escrow_account.is_initialized 
+    )]
+    pub escrow_account: Account<'info, Escrow>,
+    #[account(address = spl_token::id())]
+    pub token_program: AccountInfo<'info>,
     pub system_program: Program<'info, System>,
 }
 
-#[derive(Accounts)]
-pub struct UpdateLimit {
-    #[account(has_one = deposit_auth)]
-    pub update_deposit_account: Account<'info, DepositBase>,
-    #[account(seeds = [b"auth", deposit_account.key().as_ref()], bump = deposit_account.auth_bump)]
-    pub update_pda_auth: UncheckedAccount<'info>,
-    #[account(mut)]
-    pub update_deposit_auth: Signer<'info>,
-    #[account(init, seeds = [b"limit", token_mint.key().as_ref(), deposit_account.key().as_ref()], bump, payer = deposit_auth, space = Limit::LEN)]
-    pub update_limit_account: Account<'info, Limit>,
-    pub update_token_account: Account<'info, TokenAccount>,
-    pub update_token_mint: Account<'info, Mint>,
-    #[account(owner = Token::id())]
-    pub update_token_mint: Account<'info, Mint>,
-    pub update_system_program: Program<'info, SystemProgram>,
+#[account]
+pub struct Escrow {
+    pub is_initialized: bool,
+    pub initializer_pubkey: Pubkey,
+    pub temp_token_account_pubkey: Pubkey,
+    pub initializer_token_to_receive_account_pubkey: Pubkey,
+    pub expected_amount: u64,
+    pub unlock_time: u64,
+    pub time_out: u64
+}
+
+const DISCRIMINATOR_LENGTH: usize = 8;
+const BOOL_LENGTH: usize = 1;
+const PUBLIC_KEY_LENGTH: usize = 32;
+const U64_LENGTH: usize = 8;
+const TIMEOUT_AMT: u64 = 1000;
+const UNLOCK_DUR: u64 = 100;
+
+impl Escrow {
+    const LEN: usize = DISCRIMINATOR_LENGTH +
+        BOOL_LENGTH +
+        PUBLIC_KEY_LENGTH * 3 +
+        U64_LENGTH * 3;
+}
+
+impl<'info> From<&mut Initialize<'info>> for CpiContext<'_, '_, '_, 'info, SetAuthority<'info>> {
+    fn from(accounts: &mut Initialize<'info>) -> Self {
+        let cpi_accounts = SetAuthority {
+            current_authority: accounts.initializer.to_account_info().clone(),
+            account_or_mint: accounts.temp_token_account.to_account_info().clone(),
+        };
+        let cpi_program = accounts.token_program.to_account_info();
+        CpiContext::new(cpi_program, cpi_accounts)
+    }
+}
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Amount expected by taker does not match the deposited amount of intitializer.")]
+    ExpectedAmountMismatch,
+    #[msg("Escrow is still locked")]
+    EscrowLocked,
+    #[msg("Escrow expired")]
+    EscrowExpired
+}
+impl<'info> Initialize<'info> {
+    fn into_transfer_to_temp(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        let cpi_accounts = Transfer {
+            from: self.initializers_token_to_send_account.to_account_info().clone(),
+            to: self.temp_token_account.to_account_info().clone(),
+            authority: self.initializer.to_account_info().clone(),
+        };
+        let cpi_program = self.token_program.to_account_info();
+        CpiContext::new(cpi_program, cpi_accounts)
+    }
+}
+impl<'info> Cancel<'info> {
+    fn into_refund_context(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        let cpi_accounts = Transfer {
+            from: self.pdas_temp_token_account.to_account_info().clone(),
+            to: self.authority_token_account.to_account_info().clone(),
+            authority: self.update_auth.to_account_info().clone(),
+        };
+        let cpi_program = self.token_program.to_account_info();
+        CpiContext::new(cpi_program, cpi_accounts)
+    }
+    fn into_close_temp_token_context(&self) -> CpiContext<'_, '_, '_, 'info, CloseAccount<'info>> {
+        let cpi_accounts = CloseAccount {
+            account: self.pdas_temp_token_account.to_account_info().clone(),
+            destination: self.update_auth.to_account_info().clone(),
+            authority: self.escrow_account.to_account_info().clone(),
+        };
+        let cpi_program = self.token_program.to_account_info();
+        CpiContext::new(cpi_program, cpi_accounts)
     }
 
-#[derive(Accounts)]
-pub struct RemoveLimit {
-    #[account(has_one = deposit_auth)]
-    pub remove_deposit_account: Account<'info, DepositBase>,
-    #[account(seeds = [b"auth", deposit_account.key().as_ref()], bump = deposit_account.auth_bump)]
-    pub remove_pda_auth: UncheckedAccount<'info>,
-    #[account(mut)]
-    pub remove_deposit_auth: Signer<'info>,
-    #[account(init, seeds = [b"limit", token_mint.key().as_ref(), deposit_account.key().as_ref()], bump, payer = deposit_auth, space = Limit::LEN)]
-    pub remove_limit_account: Account<'info, Limit>,
-    pub remove_token_account: Account<'info, TokenAccount>,
-    pub remove_token_mint: Account<'info, Mint>,
-    #[account(owner = Token::id())]
-    pub remove_token_mint: Account<'info, Mint>,
-    pub remove_system_program: Program<'info, System>,
 }
+impl<'info> Exchange<'info> {
 
-#[derive(Accounts)]
-pub struct AcceptLimit {
-    #[account(has_one = deposit_auth)]
-    pub accept_deposit_account: Account<'info, DepositBase>,
-    #[account(seeds = [b"auth", deposit_account.key().as_ref()], bump = deposit_account.auth_bump)]
-    pub accept_pda_auth: UncheckedAccount<'info>,
-    #[account(mut)]
-    pub accept_deposit_auth: Signer<'info>,
-    #[account(init, seeds = [b"limit", token_mint.key().as_ref(), deposit_account.key().as_ref()], bump, payer = deposit_auth, space = Limit::LEN)]
-    pub accept_limit_account: Account<'info, Limit>,
-    pub accept_token_account: Account<'info, TokenAccount>,
-    pub accept_token_mint: Account<'info, Mint>,
-    #[account(owner = Token::id())]
-    pub accept_token_mint: Account<'info, Mint>,
-    pub accept_system_program: Program<'info, System>,
-}
 
-#[derive(Accounts)]
-pub struct MintftAndCreateMetadata<'info> {
-    #[account(has_one = deposit_auth)]
-    pub deposit_account: Account<'info, DepositBase>,
-    #[account(seeds = [b"auth", deposit_account.key().as_ref()], bump = deposit_account.auth_bump)]
-    /// CHECK: no need to check this.
-    pub pda_auth: UncheckedAccount<'info>,
-    #[account(init, payer = deposit_auth, space = MetadataAccount::LEN)]
-    pub metadata: Account<'info, MetadataAccount>,
-    #[account(mut)]
-    pub mint: Account<'info, Mint>,
-    #[account(mut)]
-    /// CHECK: add constraints later
-    pub edition: UncheckedAccount<'info>,
-    #[account(mut)]
-    pub deposit_auth: Signer<'info>,
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
-}
+    fn into_transfer_to_initializer_context(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        let cpi_accounts = Transfer {
+            from: self.takers_sending_token_account.to_account_info().clone(),
+            to: self.initializers_token_to_receive_account.to_account_info().clone(),
+            authority: self.taker.to_account_info().clone(),
+        };
+        let cpi_program = self.token_program.to_account_info();
+        CpiContext::new(cpi_program, cpi_accounts)
+    }
 
-#[account]
-pub struct DepositBase {
-    pub deposit_auth: Pubkey,
-    pub auth_bump: u8,
-    pub sol_vault_bump: Option<u8>,
-}
+    fn into_transfer_to_taker_context(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        let cpi_accounts = Transfer {
+            from: self.pdas_temp_token_account.to_account_info().clone(),
+            to: self.takers_token_to_receive_account.to_account_info().clone(),
+            authority: self.pda_account.clone(),
+        };
+        let cpi_program = self.token_program.to_account_info();
+        CpiContext::new(cpi_program, cpi_accounts)
+    }
 
-impl DepositBase {
-    const LEN: usize = 8 + 32 + 1 + 1 + 1;
-}
-
-#[account]
-pub struct Limit {
-    #[account(has_one = deposit_auth)]
-    pub deposit_account: Account<'info, DepositBase>,
-    #[account(seeds = [b"auth", deposit_account.key().as_ref()], bump = deposit_account.auth_bump)]
-    pub pda_auth: UncheckedAccount<'info>,
-    #[account(mut)]
-    pub deposit_auth: Signer<'info>,
-    #[account(init, seeds = [b"limit", token_mint.key().as_ref(), deposit_account.key().as_ref()], bump, payer = deposit_auth, space = Limit::LEN)]
-    pub limit_account: Account<'info, Limit>,
-    pub token_account: Account<'info, TokenAccount>,
-    pub token_mint: Account<'info, Mint>,
-    #[account(owner = Token::id())]
-    pub ask_token_mint: Account<'info, Mint>,
-    pub system_program: Program<'info, System>,
-}
-
-#[account]
-pub struct Asset {
-    pub asset_type: String,
-    pub asset_metadata: Option<Pubkey>,
-    pub asset_mint: Option<Pubkey>,
-}
-
-const OPTION_PUBKEY_LEN: usize = 1 + 32;
-
-impl Limit {
-    const LEN: usize = OPTION_PUBKEY_LEN * 2 + Asset::LEN * 2 + 8;
-}
-
-impl Asset {
-    const LEN: usize = 32 + OPTION_PUBKEY_LEN * 2;
+    fn into_close_temp_token_context(&self) -> CpiContext<'_, '_, '_, 'info, CloseAccount<'info>> {
+        let cpi_accounts = CloseAccount {
+            account: self.pdas_temp_token_account.to_account_info().clone(),
+            destination: self.initializers_main_account.clone(),
+            authority: self.pda_account.clone(),
+        };
+        let cpi_program = self.token_program.to_account_info();
+        CpiContext::new(cpi_program, cpi_accounts)
+    }
 }
