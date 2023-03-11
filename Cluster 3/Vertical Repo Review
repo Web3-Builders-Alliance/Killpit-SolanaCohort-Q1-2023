@@ -1,4 +1,9 @@
-0xNineteen/drift-funding-vault has withdraw, update position, slippage, trade, liquidation, funding, deposit, order validations and state functions, 
-making it a DeFi protocol. 
-Generally created with by using Anchor framework, they created a full-stack DeFi application with a comprehensive testing suite, 
-allowing all other comprehensive tests to be conducted.
+OpenBook Vertical Repo Review
+
+High level review: The repo works as a DeFi infrastructure for Solana projects.
+
+Initially as built on top of SerumDEX project, the entrypoint (business logic) is defined on lib.rs on each separate folder by using Anchor. 
+
+The code has been organized into functions, enums, structs which define each process (open book, sell, create position etc.) and to import other files,
+mod or use has been frequently used to make other files work. So, it works as a financial infrastructure for anyone wanting to create DEX or other DeFi 
+instruments.
