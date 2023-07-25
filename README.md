@@ -15,5 +15,4 @@ The prerequisities are written with rustc 1.64.0 (a55dd71d5 2022-09-19), rustup 
 
 ## Programming Languages and Frameworks Used
 
--Rust 
--Anchor
+Rust and TypeScript are used as programming languages and Anchor has been used to create and deploy Solana programs
